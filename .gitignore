@@ -1,0 +1,19 @@
+# Actions 产物（本地跑脚本时也会生成）
+out/
+parts/
+*.part
+*.part.*
+
+# Python
+__pycache__/
+*.pyc
+
+# 日志
+fetch.log
+VERIFY_FAILED.txt
+
+# 实际检材数据，绝不入库
+*.001
+*.E01
+*.dd
+*.zip
