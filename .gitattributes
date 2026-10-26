@@ -1,0 +1,4 @@
+# 强制 LF：workflow 里的 shell 脚本混进 CRLF 会让 runner 报 "bad interpreter" 或神秘失败
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
