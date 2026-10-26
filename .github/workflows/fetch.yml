@@ -1,0 +1,152 @@
+name: fetch-cfreds
+
+# 在 GitHub 的免费 runner 上把 CFReDS 的 Google Drive 数据搬下来，产出可下载的 Release。
+# 用法：Actions 页面 → 本 workflow → Run workflow → 填/选参数 → Run。
+# 建议先 mode=list 跑一次（1 分钟），看清每个文件多大，再 mode=download。
+
+on:
+  workflow_dispatch:
+    inputs:
+      folder_id:
+        description: "Google Drive 文件夹 ID（DF001 默认已填）"
+        required: true
+        default: "1prdK0e5eEefzCShMOw2WfwBtO8EL8bzw"
+      mode:
+        description: "list=只出清单不下载；download=真下"
+        type: choice
+        options: [list, download]
+        default: list
+      include:
+        description: "只下载匹配此正则的路径（留空=全部，例：\\.001$|README)"
+        required: false
+        default: ""
+      max_total_gb:
+        description: "下载总量上限 GB（0=不限；runner 磁盘约 30GB 可用）"
+        required: false
+        default: "20"
+      publish_release:
+        description: "下载完成后打 Release 供国内下载（true/false）"
+        type: choice
+        options: ["true", "false"]
+        default: "true"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fetch-${{ github.event.inputs.folder_id }}
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: pip install --quiet requests
+
+      - name: 看看磁盘
+        run: df -h / && nproc
+
+      - name: 枚举 + 下载
+        env:
+          FOLDER_ID: ${{ github.event.inputs.folder_id }}
+          MODE: ${{ github.event.inputs.mode }}
+          INCLUDE: ${{ github.event.inputs.include }}
+          MAXGB: ${{ github.event.inputs.max_total_gb }}
+        run: |
+          set -o pipefail
+          python fetch_drive.py "$MODE" \
+            --folder-id "$FOLDER_ID" \
+            --out out \
+            --include "$INCLUDE" \
+            --max-total-gb "$MAXGB" 2>&1 | tee fetch.log
+
+      - name: 打包成不超过 1.8GB 的分卷 + 生成合并脚本
+        if: ${{ github.event.inputs.mode == 'download' && github.event.inputs.publish_release == 'true' }}
+        run: |
+          mkdir -p parts
+          cd out
+          SH=../parts/MERGE.sh
+          PS=../parts/MERGE.ps1
+          echo '#!/usr/bin/env bash' > "$SH"
+          echo '# 用法：和分卷文件放在同一目录，执行 bash MERGE.sh' >> "$SH"
+          echo '# 用法：和分卷文件放在同一目录，执行 powershell -ExecutionPolicy Bypass -File .\MERGE.ps1' > "$PS"
+
+          find . -type f ! -name 'manifest.*' ! -name '*.log' ! -name '*.part' | while read -r f; do
+            rel="${f#./}"
+            flat=$(echo "$rel" | tr '/' '_')
+            wrel=$(echo "$rel" | tr '/' '\\')
+            wdir=$(dirname "$rel" | tr '/' '\\')
+            sz=$(stat -c%s "$f")
+
+            if [ "$sz" -gt 1800000000 ]; then
+              echo "split: $rel ($sz)"
+              split -b 1800M -d -a 3 "$f" "../parts/${flat}.part."
+              # bash
+              printf 'mkdir -p "%s"; cat "%s.part."* > "%s"\n' \
+                "$(dirname "$rel")" "$flat" "$rel" >> "$SH"
+              # powershell
+              printf 'New-Item -ItemType Directory -Force -Path "%s" | Out-Null\n$dst=[IO.File]::Create("%s")\nGet-ChildItem "%s.part.*" | Sort-Object Name | %%{ $src=[IO.File]::OpenRead($_.FullName); $src.CopyTo($dst); $src.Close() }\n$dst.Close()\n' \
+                "$wdir" "$wrel" "$flat" >> "$PS"
+            else
+              cp "$f" "../parts/${flat}"
+              if [ "$flat" != "$rel" ]; then
+                printf 'mkdir -p "%s"; cp "%s" "%s"\n' \
+                  "$(dirname "$rel")" "$flat" "$rel" >> "$SH"
+                printf 'New-Item -ItemType Directory -Force -Path "%s" | Out-Null\nCopy-Item -Force "%s" "%s"\n' \
+                  "$wdir" "$flat" "$wrel" >> "$PS"
+              fi
+            fi
+          done
+
+          echo ""
+          echo "== 分卷产物 =="
+          ls -lh ../parts | tail -50
+          echo ""
+          echo "== MERGE.sh =="; cat "$SH"
+          echo ""
+          echo "== MERGE.ps1 =="; cat "$PS"
+
+      - name: 上传清单（任何情况都保留）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-${{ github.run_number }}
+          path: |
+            out/manifest.csv
+            out/manifest.json
+            fetch.log
+          if-no-files-found: warn
+
+      - name: 上传数据本身（只在不打 Release 时；单 artifact 上限约 10GB）
+        if: ${{ github.event.inputs.mode == 'download' && github.event.inputs.publish_release == 'false' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-${{ github.run_number }}
+          path: out/**
+          if-no-files-found: error
+          compression-level: 0   # 镜像本身已是压缩态，再压只是浪费时间
+
+      - name: 发布 Release
+        if: ${{ github.event.inputs.mode == 'download' && github.event.inputs.publish_release == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "$(ls -A parts 2>/dev/null)" ]; then
+            echo "!! parts 为空（下载可能全部失败），跳过 Release，请查看上面的日志"
+            exit 0
+          fi
+          cp out/manifest.csv parts/ 2>/dev/null || true
+          TAG="cfreds-${{ github.event.inputs.folder_id }}-${{ github.run_number }}"
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "CFReDS ${{ github.event.inputs.folder_id }} (run ${{ github.run_number }})" \
+            --notes "由 GitHub Actions 从 NIST CFReDS 公开 Google Drive 文件夹搬运。分卷文件需按序合并（见 README 第 6 步），并用同时附带的 .md5/.sha1 校验。" \
+            parts/*
+          echo "✔ Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
